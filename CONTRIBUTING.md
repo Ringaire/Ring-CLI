@@ -13,7 +13,7 @@
 - 一个 LLM API key（用于功能测试）
 
 ```bash
-git clone https://github.com/Ringaire/RingCLI.git
+git clone https://github.com/Ringaire/Ring-CLI.git
 cd RingCLI
 cargo build
 ```

@@ -75,6 +75,7 @@ tokio-tungstenite = "0.24"
 pulldown-cmark = "0.13"
 sha2           = "0.10"
 url            = "2"
+os_info        = "3"
 
 # 数据库 + 压缩
 rusqlite       = { version = "0.32", features = ["bundled"] }

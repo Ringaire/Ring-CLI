@@ -14,13 +14,13 @@ fn main() {
         println!("  base_url: {:?}", entry.base_url);
         println!(
             "  api_key: {:?}",
-            entry.api_key.as_ref().map(|k| format!("{}...", k.chars().take(10).collect::<String>()))
+            entry.api_key.first().map(|k| format!("{}...", k.chars().take(10).collect::<String>()))
         );
         println!("  api_key_env: {:?}", entry.api_key_env);
         
-        // 模拟 factory 逻辑
-        let api_key = entry.api_key.clone()
+        let api_key = entry.api_key.first()
             .filter(|k| !k.trim().is_empty())
+            .cloned()
             .or_else(|| entry.api_key_env.as_deref().and_then(|env| std::env::var(env).ok()))
             .unwrap_or_default();
         
