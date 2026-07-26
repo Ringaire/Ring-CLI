@@ -4,7 +4,7 @@ pub mod responses;
 /// 该 provider 的 catalog 条目。
 pub fn catalog_entry() -> crate::catalog::CatalogEntry {
     crate::catalog::CatalogEntry {
-        api_key: None,
+        api_key: Vec::new(),
         name: "OpenAI".into(),
         kind: crate::catalog::ProviderKind::OpenAi,
         base_url: Some("https://api.openai.com/v1".into()),
@@ -161,7 +161,11 @@ impl OpenAiProvider {
         org_id:    Option<String>,
         def_model: Option<String>,
     ) -> Self {
-        let client = crate::provider::build_http_client(None, CONNECT_TIMEOUT_SECS);
+        let client = crate::provider::build_http_client_with(
+            None,
+            CONNECT_TIMEOUT_SECS,
+            crate::user_agent::codex_headers(),
+        );
         Self::with_client(client, api_key, base_url, org_id, def_model)
     }
 
@@ -188,26 +192,37 @@ impl OpenAiProvider {
     }
 
     fn build_body(&self, req: &ChatRequest, stream: bool) -> Value {
+        let mut messages = convert_messages(&req.messages);
+        if let Some(sys) = &req.system {
+            if !sys.is_empty() {
+                if let Some(arr) = messages.as_array_mut() {
+                    arr.insert(0, json!({"role": "system", "content": sys}));
+                }
+            }
+        }
         let mut body = json!({
             "model":    req.model,
-            "messages": convert_messages(&req.messages),
+            "messages": messages,
             "stream":   stream,
         });
         if !req.tools.is_empty() {
             body["tools"] = convert_tools(&req.tools);
         }
         if let Some(t) = req.temperature {
-            // round 到 2 位小数，避免 f32 精度溢出（某些 provider 限制小数位数）
             body["temperature"] = json!((t as f64 * 100.0).round() / 100.0);
+        }
+        if let Some(p) = req.top_p {
+            body["top_p"] = json!((p as f64 * 100.0).round() / 100.0);
+        }
+        if !req.stop.is_empty() {
+            body["stop"] = json!(req.stop);
         }
         if req.max_tokens > 0 {
             body["max_tokens"] = json!(req.max_tokens);
         }
-        // reasoning effort（OpenAI o-series / 智谱 GLM-5+）
         if let Some(effort) = &req.reasoning_effort {
             body["reasoning_effort"] = json!(effort);
         }
-        // 合并 extra_body（catalog 注入的 provider 特有字段，如 Ollama 的 options.num_ctx）
         if let Some(extra) = &self.extra_body {
             if let Some(obj) = extra.as_object() {
                 let body_obj = body.as_object_mut().unwrap();
@@ -273,9 +288,22 @@ impl Provider for OpenAiProvider {
         if let Some(tc) = msg_val["tool_calls"].as_array() {
             for call in tc {
                 let id   = call["id"].as_str().unwrap_or("").to_string();
-                let name = call["function"]["name"].as_str().unwrap_or("").to_string();
-                let args = call["function"]["arguments"].as_str().unwrap_or("{}");
-                let input: Value = serde_json::from_str(args).unwrap_or(Value::Object(Default::default()));
+                let name = call["function"]["name"].as_str()
+                    .or_else(|| call["name"].as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let args_val = if call["function"]["arguments"].is_string() || call["function"]["arguments"].is_object() {
+                    &call["function"]["arguments"]
+                } else {
+                    &call["arguments"]
+                };
+                let input: Value = if let Some(s) = args_val.as_str() {
+                    serde_json::from_str(s).unwrap_or(Value::Object(Default::default()))
+                } else if args_val.is_object() {
+                    args_val.clone()
+                } else {
+                    Value::Object(Default::default())
+                };
                 content.push(ContentBlock::ToolUse { tool_use_id: id, tool_name: name, tool_input: input });
             }
         }
@@ -403,12 +431,15 @@ async fn run_openai_sse<S>(
                                 .or_insert_with(|| (String::new(), String::new(), String::new(), false));
 
                             if let Some(id) = tc["id"].as_str() {
-                                entry.0 = id.to_string();
-                            }
-                            if let Some(name) = tc["function"]["name"].as_str() {
-                                if !name.is_empty() {
-                                    entry.1 = name.to_string();
+                                if !id.is_empty() {
+                                    entry.0 = id.to_string();
                                 }
+                            }
+                            let name = tc["function"]["name"].as_str()
+                                .or_else(|| tc["name"].as_str())
+                                .unwrap_or("");
+                            if !name.is_empty() {
+                                entry.1 = name.to_string();
                             }
                             // 首次有 id + name 时发 ToolCallStart
                             if !entry.3 && !entry.0.is_empty() && !entry.1.is_empty() {
@@ -418,7 +449,12 @@ async fn run_openai_sse<S>(
                                     tool_name: entry.1.clone(),
                                 })).await;
                             }
-                            if let Some(args_delta) = tc["function"]["arguments"].as_str() {
+                            let args_val = if tc["function"]["arguments"].is_string() || tc["function"]["arguments"].is_object() {
+                                &tc["function"]["arguments"]
+                            } else {
+                                &tc["arguments"]
+                            };
+                            if let Some(args_delta) = args_val.as_str() {
                                 if !args_delta.is_empty() {
                                     entry.2.push_str(args_delta);
                                     let _ = tx.send(StreamEvent::Chunk(StreamChunk::ToolCallInput {
@@ -426,6 +462,13 @@ async fn run_openai_sse<S>(
                                         delta:   args_delta.to_string(),
                                     })).await;
                                 }
+                            } else if args_val.is_object() {
+                                let obj_str = args_val.to_string();
+                                entry.2 = obj_str.clone();
+                                let _ = tx.send(StreamEvent::Chunk(StreamChunk::ToolCallInput {
+                                    call_id: entry.0.clone(),
+                                    delta:   obj_str,
+                                })).await;
                             }
                         }
                     }
@@ -470,16 +513,44 @@ async fn flush_tool_calls(
     }
 }
 
-/// OpenAI 主流模型的统一上下文窗口（gpt-4o / o 系列均 128k）。
+/// OpenAI 主流模型的统一上下文窗口（gpt-4o / o 系列均 128k，4.1 系列 1M）。
 const GPT_CONTEXT_WINDOW: u64 = 128_000;
+const GPT41_CONTEXT_WINDOW: u64 = 1_047_576;
 
 pub fn openai_known_models() -> Vec<ModelInfo> {
     vec![
         ModelInfo {
+            id: "gpt-4.1".into(),
+            display_name: "GPT-4.1".into(),
+            context_window: GPT41_CONTEXT_WINDOW,
+            max_output_tokens: 32_768,
+            supports_vision: true,
+            supports_thinking: false,
+            supports_tools: true,
+        },
+        ModelInfo {
+            id: "gpt-4.1-mini".into(),
+            display_name: "GPT-4.1 mini".into(),
+            context_window: GPT41_CONTEXT_WINDOW,
+            max_output_tokens: 32_768,
+            supports_vision: true,
+            supports_thinking: false,
+            supports_tools: true,
+        },
+        ModelInfo {
+            id: "gpt-4.1-nano".into(),
+            display_name: "GPT-4.1 nano".into(),
+            context_window: GPT41_CONTEXT_WINDOW,
+            max_output_tokens: 32_768,
+            supports_vision: true,
+            supports_thinking: false,
+            supports_tools: true,
+        },
+        ModelInfo {
             id: "gpt-4o".into(),
             display_name: "GPT-4o".into(),
             context_window: GPT_CONTEXT_WINDOW,
-            max_output_tokens: 16_000,
+            max_output_tokens: 16_384,
             supports_vision: true,
             supports_thinking: false,
             supports_tools: true,
@@ -488,16 +559,43 @@ pub fn openai_known_models() -> Vec<ModelInfo> {
             id: "gpt-4o-mini".into(),
             display_name: "GPT-4o mini".into(),
             context_window: GPT_CONTEXT_WINDOW,
-            max_output_tokens: 16_000,
+            max_output_tokens: 16_384,
             supports_vision: true,
             supports_thinking: false,
+            supports_tools: true,
+        },
+        ModelInfo {
+            id: "o3".into(),
+            display_name: "o3".into(),
+            context_window: GPT_CONTEXT_WINDOW,
+            max_output_tokens: 100_000,
+            supports_vision: true,
+            supports_thinking: true,
+            supports_tools: true,
+        },
+        ModelInfo {
+            id: "o3-pro".into(),
+            display_name: "o3-pro".into(),
+            context_window: GPT_CONTEXT_WINDOW,
+            max_output_tokens: 100_000,
+            supports_vision: true,
+            supports_thinking: true,
+            supports_tools: true,
+        },
+        ModelInfo {
+            id: "o4-mini".into(),
+            display_name: "o4-mini".into(),
+            context_window: GPT_CONTEXT_WINDOW,
+            max_output_tokens: 100_000,
+            supports_vision: true,
+            supports_thinking: true,
             supports_tools: true,
         },
         ModelInfo {
             id: "o1".into(),
             display_name: "o1".into(),
             context_window: GPT_CONTEXT_WINDOW,
-            max_output_tokens: 32_000,
+            max_output_tokens: 32_768,
             supports_vision: true,
             supports_thinking: true,
             supports_tools: true,

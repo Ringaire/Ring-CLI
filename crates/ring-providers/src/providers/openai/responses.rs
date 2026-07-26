@@ -30,7 +30,7 @@ const DEFAULT_MODEL: &str = "gpt-4o";
 /// 该 provider 的 catalog 条目。
 pub fn catalog_entry() -> crate::catalog::CatalogEntry {
     crate::catalog::CatalogEntry {
-        api_key: None,
+        api_key: Vec::new(),
         name: "OpenAI Responses".into(),
         kind: crate::catalog::ProviderKind::OpenAiResponses,
         base_url: Some("https://api.openai.com/v1".into()),
@@ -165,7 +165,11 @@ impl OpenAiResponsesProvider {
         org_id:    Option<String>,
         def_model: Option<String>,
     ) -> Self {
-        let client = crate::provider::build_http_client(None, CONNECT_TIMEOUT_SECS);
+        let client = crate::provider::build_http_client_with(
+            None,
+            CONNECT_TIMEOUT_SECS,
+            crate::user_agent::codex_headers(),
+        );
         Self::with_client(client, api_key, base_url, org_id, def_model)
     }
 
@@ -208,6 +212,12 @@ impl OpenAiResponsesProvider {
         }
         if let Some(t) = req.temperature {
             body["temperature"] = json!((t as f64 * 100.0).round() / 100.0);
+        }
+        if let Some(p) = req.top_p {
+            body["top_p"] = json!((p as f64 * 100.0).round() / 100.0);
+        }
+        if !req.stop.is_empty() {
+            body["stop"] = json!(req.stop);
         }
         if req.max_tokens > 0 {
             body["max_output_tokens"] = json!(req.max_tokens);
