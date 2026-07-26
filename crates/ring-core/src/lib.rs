@@ -15,6 +15,10 @@ pub use config::{
     load_config, load_user_config, save_config, McpServerConfig, RingUserConfig, ProviderEntry,
     ResolvedConfig,
 };
+pub use config::auth::{
+    auth_path, get_api_key, load_auth_store, remove_auth_entry, save_auth_store, AuthEntry,
+    AuthStore,
+};
 pub use events::{EventBus, RingEvent};
 pub use permissions::{DefaultPermissionEngine, ModeName, PermissionAction};
 pub use runtime::{McpManager, RingRuntime};

@@ -1,3 +1,5 @@
+pub mod auth;
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -6,16 +8,47 @@ use crate::session::paths;
 
 // ── Provider 配置 ─────────────────────────────────────────────────────────────
 
+pub mod api_key_serde {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+    where D: Deserializer<'de>
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum OneOrMany {
+            Single(String),
+            Multiple(Vec<String>),
+        }
+        Ok(match Option::<OneOrMany>::deserialize(deserializer)? {
+            Some(OneOrMany::Single(s)) => vec![s],
+            Some(OneOrMany::Multiple(v)) => v,
+            None => vec![],
+        })
+    }
+
+    pub fn serialize<S>(keys: &[String], serializer: S) -> Result<S::Ok, S::Error>
+    where S: Serializer
+    {
+        match keys.len() {
+            0 => serializer.serialize_none(),
+            1 => serializer.serialize_str(&keys[0]),
+            _ => keys.serialize(serializer),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderEntry {
-    /// Provider implementation kind, e.g. `anthropic` or `openai-compatible`.
-    #[serde(rename = "type", alias = "kind")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(rename = "type", alias = "kind", skip_serializing_if = "Option::is_none")]
     pub provider_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub api_key:  Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
+    #[serde(default, with = "api_key_serde", skip_serializing_if = "Vec::is_empty")]
+    pub api_key: Vec<String>,
 }
 
 // ── 手动模型能力定义（覆盖 models.dev）─────────────────────────────────────────
@@ -112,6 +145,10 @@ pub struct RingUserConfig {
     pub model_caps:  Option<HashMap<String, ModelCaps>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vision_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub img_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ocr_model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy:       Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -133,6 +170,10 @@ pub struct ResolvedConfig {
     /// 视觉辅助模型（provider/model 格式），供 image_analyze 工具调用。
     /// 主模型不支持 image 时，图片转发给此模型识别。
     pub vision_model: Option<String>,
+    /// 图片识别模型（provider/model 格式），专用于图片内容理解。
+    pub img_model: Option<String>,
+    /// OCR 模型（provider/model 格式），专用于文字提取。
+    pub ocr_model: Option<String>,
     pub proxy:       Option<String>,
     pub mcp_servers: HashMap<String, McpServerConfig>,
     pub session:     SessionConfig,
@@ -148,6 +189,8 @@ impl Default for ResolvedConfig {
             models:      HashMap::new(),
             model_caps:  HashMap::new(),
             vision_model: None,
+            img_model:   None,
+            ocr_model:   None,
             proxy:       None,
             mcp_servers: HashMap::new(),
             session:     SessionConfig::default(),
@@ -223,6 +266,8 @@ fn merge_config(base: &mut RingUserConfig, over: RingUserConfig) {
     if let Some(s) = over.session { base.session = Some(s); }
     if let Some(u) = over.ui      { base.ui      = Some(u); }
     if let Some(vm) = over.vision_model { base.vision_model = Some(vm); }
+    if let Some(im) = over.img_model { base.img_model = Some(im); }
+    if let Some(om) = over.ocr_model { base.ocr_model = Some(om); }
 }
 
 // ── Claude Code 兼容：.mcp.json 读取 ──────────────────────────────────────────
@@ -470,6 +515,8 @@ pub async fn load_config(cwd: Option<&std::path::Path>) -> ResolvedConfig {
         models:      merged.models.unwrap_or_default(),
         model_caps:  merged.model_caps.unwrap_or_default(),
         vision_model: merged.vision_model,
+        img_model:   merged.img_model,
+        ocr_model:   merged.ocr_model,
         proxy,
         mcp_servers: merged.mcp_servers.unwrap_or_default(),
         session:     merged.session.unwrap_or_default(),
@@ -550,11 +597,11 @@ const KNOWN_PROVIDERS: &[&str] = &[
 fn inject_env_keys(providers: &mut HashMap<String, ProviderEntry>) {
     // 已声明的 provider：补全缺失字段
     for (id, entry) in providers.iter_mut() {
-        if entry.api_key.is_none() {
+        if entry.api_key.is_empty() {
             if let Some(var) = env_var_for_provider(id) {
                 if let Ok(val) = std::env::var(var) {
                     if !val.trim().is_empty() {
-                        entry.api_key = Some(val);
+                        entry.api_key = vec![val];
                     }
                 }
             }
@@ -585,7 +632,8 @@ fn inject_env_keys(providers: &mut HashMap<String, ProviderEntry>) {
         if api_key.is_some() || base_url.is_some() {
             providers.insert(id.to_string(), ProviderEntry {
                 provider_type: None,
-                api_key,
+                name: None,
+                api_key: api_key.map(|k| vec![k]).unwrap_or_default(),
                 base_url,
             });
         }
