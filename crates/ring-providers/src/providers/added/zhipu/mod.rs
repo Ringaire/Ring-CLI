@@ -5,7 +5,7 @@ use crate::catalog::{CatalogEntry, ProviderKind};
 /// 该 provider 的 catalog 条目。
 pub fn catalog_entry() -> CatalogEntry {
     CatalogEntry {
-        api_key: None,
+        api_key: Vec::new(),
         name: "Zhipu AI".into(),
         kind: ProviderKind::OpenAiCompatible,
         base_url: Some("https://open.bigmodel.cn/api/paas/v4".into()),

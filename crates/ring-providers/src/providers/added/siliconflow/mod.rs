@@ -5,7 +5,7 @@ use crate::catalog::{CatalogEntry, ProviderKind};
 /// 该 provider 的 catalog 条目。
 pub fn catalog_entry() -> CatalogEntry {
     CatalogEntry {
-        api_key: None,
+        api_key: Vec::new(),
         name: "SiliconFlow".into(),
         kind: ProviderKind::OpenAiCompatible,
         base_url: Some("https://api.siliconflow.cn/v1".into()),

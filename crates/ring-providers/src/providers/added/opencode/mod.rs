@@ -4,7 +4,7 @@ use crate::catalog::{CatalogEntry, ProviderKind};
 
 pub fn catalog_entry() -> CatalogEntry {
     CatalogEntry {
-        api_key: None,
+        api_key: Vec::new(),
         name: "OpenCode".into(),
         kind: ProviderKind::OpenAiCompatible,
         base_url: Some("http://localhost:3000/v1".into()),

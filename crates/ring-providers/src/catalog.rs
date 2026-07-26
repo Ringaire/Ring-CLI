@@ -22,6 +22,8 @@ pub enum ProviderKind {
     Gemini,
     #[serde(rename = "openai-compatible")]
     OpenAiCompatible,
+    #[serde(rename = "ollama-native")]
+    OllamaNative,
 }
 
 /// 完整的 provider 定义（合并后的最终形态）。
@@ -31,8 +33,8 @@ pub struct CatalogEntry {
     #[serde(rename = "type")]
     pub kind: ProviderKind,
     pub base_url: Option<String>,
-    #[serde(default)]
-    pub api_key: Option<String>,
+    #[serde(default, with = "ring_core::config::api_key_serde", skip_serializing_if = "Vec::is_empty")]
+    pub api_key: Vec<String>,
     pub api_key_env: Option<String>,
     #[serde(default)]
     pub default_model: Option<String>,
@@ -47,8 +49,8 @@ struct Override {
     #[serde(rename = "type")]
     kind: Option<ProviderKind>,
     base_url: Option<String>,
-    #[serde(alias = "apikey")]
-    api_key: Option<String>,
+    #[serde(default, with = "ring_core::config::api_key_serde", alias = "apikey")]
+    api_key: Vec<String>,
     api_key_env: Option<String>,
     default_model: Option<String>,
     extra_body: Option<serde_json::Value>,
@@ -124,6 +126,40 @@ pub fn defaults() -> HashMap<String, CatalogEntry> {
     m.insert("vercel-gateway".into(),      added::vercel_gateway::catalog_entry());
     m.insert("opencode".into(),            added::opencode::catalog_entry());
 
+    // T1 新增：opencode 对齐
+    m.insert("alibaba".into(),                  added::alibaba::catalog_entry());
+    m.insert("alibaba-token-plan-cn".into(),    added::alibaba_token_plan_cn::catalog_entry());
+    m.insert("amazon-bedrock".into(),           added::amazon_bedrock::catalog_entry());
+    m.insert("azure".into(),                    added::azure::catalog_entry());
+    m.insert("azure-cognitive-services".into(), added::azure_cognitive_services::catalog_entry());
+    m.insert("github-copilot".into(),           added::github_copilot::catalog_entry());
+    m.insert("gitlab".into(),                   added::gitlab::catalog_entry());
+    m.insert("google-vertex".into(),            added::google_vertex::catalog_entry());
+    m.insert("google-vertex-anthropic".into(),  added::google_vertex_anthropic::catalog_entry());
+    m.insert("kilo".into(),                     added::kilo::catalog_entry());
+    m.insert("llmgateway".into(),               added::llmgateway::catalog_entry());
+    m.insert("meta".into(),                     added::meta::catalog_entry());
+    m.insert("sap-ai-core".into(),              added::sap_ai_core::catalog_entry());
+    m.insert("snowflake-cortex".into(),         added::snowflake_cortex::catalog_entry());
+    m.insert("venice".into(),                   added::venice::catalog_entry());
+    m.insert("zenmux".into(),                   added::zenmux::catalog_entry());
+    m.insert("302ai".into(),                    added::three02ai::catalog_entry());
+    m.insert("baseten".into(),                  added::baseten::catalog_entry());
+    m.insert("cortecs".into(),                  added::cortecs::catalog_entry());
+    m.insert("digitalocean".into(),             added::digitalocean::catalog_entry());
+    m.insert("frogbot".into(),                  added::frogbot::catalog_entry());
+    m.insert("gmi-cloud".into(),                added::gmi_cloud::catalog_entry());
+    m.insert("helicone".into(),                 added::helicone::catalog_entry());
+    m.insert("io-net".into(),                   added::io_net::catalog_entry());
+    m.insert("nebius".into(),                   added::nebius::catalog_entry());
+    m.insert("ollama-cloud".into(),             added::ollama_cloud::catalog_entry());
+    m.insert("ovhcloud".into(),                 added::ovhcloud::catalog_entry());
+    m.insert("scaleway".into(),                 added::scaleway::catalog_entry());
+    m.insert("stackit".into(),                  added::stackit::catalog_entry());
+    m.insert("kimi-coding".into(),              added::kimi_coding::catalog_entry());
+    m.insert("opencode-go".into(),              added::opencode_go::catalog_entry());
+    m.insert("qwen-token-plan".into(),          added::qwen_token_plan::catalog_entry());
+
     m
 }
 
@@ -154,7 +190,7 @@ fn merge_file(catalog: &mut HashMap<String, CatalogEntry>, path: &Path) {
             if let Some(n) = ov.name     { entry.name = n; }
             if let Some(k) = ov.kind     { entry.kind = k; }
             if let Some(u) = ov.base_url { entry.base_url = Some(u); }
-            if let Some(a) = ov.api_key  { entry.api_key = Some(a); }
+            if !ov.api_key.is_empty()    { entry.api_key = ov.api_key.clone(); }
             if let Some(e) = ov.api_key_env { entry.api_key_env = Some(e); }
             if let Some(m) = ov.default_model { entry.default_model = Some(m); }
             if let Some(b) = ov.extra_body { entry.extra_body = Some(b); }
@@ -171,7 +207,7 @@ fn merge_file(catalog: &mut HashMap<String, CatalogEntry>, path: &Path) {
                 name: ov.name.unwrap_or_else(|| id.clone()),
                 kind,
                 base_url: Some(base_url),
-                api_key: ov.api_key,
+                api_key: ov.api_key.clone(),
                 api_key_env: ov.api_key_env,
                 default_model: ov.default_model,
                 extra_body: ov.extra_body,
