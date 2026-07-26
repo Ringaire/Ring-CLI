@@ -37,12 +37,22 @@ pub async fn check_response_error(
     Ok(resp)
 }
 
-/// 构建带可选代理的 reqwest 客户端。
+/// 构建带可选代理的 reqwest 客户端（默认 ring UA）。
 /// proxy 解析失败时回退为无代理（不静默 panic）。
 pub fn build_http_client(proxy: Option<&str>, connect_timeout_secs: u64) -> reqwest::Client {
+    build_http_client_with(proxy, connect_timeout_secs, crate::user_agent::default_headers())
+}
+
+/// 构建带可选代理 + 自定义 default headers 的 reqwest 客户端。
+/// 用于 OpenAI（Codex UA）、Anthropic（Claude UA）等需要伪装身份的场景。
+pub fn build_http_client_with(
+    proxy: Option<&str>,
+    connect_timeout_secs: u64,
+    headers: reqwest::header::HeaderMap,
+) -> reqwest::Client {
     let mut builder = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(connect_timeout_secs))
-        .user_agent(concat!("ring/", env!("CARGO_PKG_VERSION")));
+        .default_headers(headers);
 
     if let Some(proxy_url) = proxy {
         if !proxy_url.trim().is_empty() {
@@ -178,6 +188,24 @@ pub struct ModelInfo {
     pub supports_vision:  bool,
     pub supports_thinking: bool,
     pub supports_tools:   bool,
+}
+
+impl ModelInfo {
+    pub fn format_display_name(provider_name: &str, model_id: &str) -> String {
+        let capitalize = |s: &str| -> String {
+            s.split('-')
+                .map(|part| {
+                    let mut chars = part.chars();
+                    match chars.next() {
+                        None => String::new(),
+                        Some(c) => c.to_uppercase().to_string() + chars.as_str(),
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("-")
+        };
+        format!("{}/{}", capitalize(provider_name), capitalize(model_id))
+    }
 }
 
 // ── Provider trait ────────────────────────────────────────────────────────────

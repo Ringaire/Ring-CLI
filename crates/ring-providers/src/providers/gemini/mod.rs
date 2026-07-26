@@ -1,7 +1,7 @@
 /// 该 provider 的 catalog 条目。
 pub fn catalog_entry() -> crate::catalog::CatalogEntry {
     crate::catalog::CatalogEntry {
-        api_key: None,
+        api_key: Vec::new(),
         name: "Google Gemini".into(),
         kind: crate::catalog::ProviderKind::Gemini,
         base_url: Some("https://generativelanguage.googleapis.com".into()),
@@ -15,6 +15,7 @@ use async_trait::async_trait;
 use ring_core::tools::{ContentBlock, Message, MessageRole};
 use reqwest::Client;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
@@ -27,28 +28,86 @@ use crate::provider::{
 const GEMINI_BASE_URL: &str = "https://generativelanguage.googleapis.com";
 const CONNECT_TIMEOUT_SECS: u64 = 10;
 const DEFAULT_MODEL: &str = "gemini-2.0-flash";
+const DEFAULT_THINKING_BUDGET: u32 = 16_384;
 
+fn effort_to_thinking_budget(effort: Option<&str>) -> u32 {
+    match effort {
+        Some("max")                => 24_576,
+        Some("xhigh")              => 24_576,
+        Some("high")               => 16_384,
+        Some("medium")             => 8_192,
+        Some("low") | Some("minimal") => 4_096,
+        _                          => DEFAULT_THINKING_BUDGET,
+    }
+}
+
+/// 把内部消息列表转为 Gemini `contents` 数组。
+///
+/// 先扫描所有 ToolUse 建立 tool_use_id → tool_name 映射，
+/// 以便 ToolResult 能正确填写 functionResponse.name。
 fn convert_messages_to_contents(msgs: &[Message]) -> Value {
+    let mut tool_names: HashMap<String, String> = HashMap::new();
+    for msg in msgs {
+        for blk in &msg.content {
+            if let ContentBlock::ToolUse { tool_use_id, tool_name, .. } = blk {
+                tool_names.insert(tool_use_id.clone(), tool_name.clone());
+            }
+        }
+    }
+
     let mut contents = Vec::new();
     for msg in msgs {
-        let role = match msg.role {
-            MessageRole::User | MessageRole::ToolResult => "user",
-            MessageRole::Assistant => "model",
-        };
-        let parts: Vec<Value> = msg
-            .content
-            .iter()
-            .filter_map(|blk| match blk {
-                ContentBlock::Text { text } => Some(json!({ "text": text })),
-                // Gemini 图片：inline_data（base64）
-                ContentBlock::Image { media_type, data } => Some(json!({
-                    "inline_data": { "mime_type": media_type, "data": data }
-                })),
-                _ => None,
-            })
-            .collect();
-        if !parts.is_empty() {
-            contents.push(json!({ "role": role, "parts": parts }));
+        match msg.role {
+            MessageRole::User => {
+                let parts: Vec<Value> = msg.content.iter()
+                    .filter_map(|blk| match blk {
+                        ContentBlock::Text { text } => Some(json!({ "text": text })),
+                        ContentBlock::Image { media_type, data } => Some(json!({
+                            "inline_data": { "mime_type": media_type, "data": data }
+                        })),
+                        _ => None,
+                    })
+                    .collect();
+                if !parts.is_empty() {
+                    contents.push(json!({ "role": "user", "parts": parts }));
+                }
+            }
+            MessageRole::Assistant => {
+                let parts: Vec<Value> = msg.content.iter()
+                    .filter_map(|blk| match blk {
+                        ContentBlock::Text { text } => Some(json!({ "text": text })),
+                        ContentBlock::ToolUse { tool_name, tool_input, .. } => Some(json!({
+                            "functionCall": { "name": tool_name, "args": tool_input }
+                        })),
+                        ContentBlock::Thinking { .. }
+                        | ContentBlock::ToolResult { .. }
+                        | ContentBlock::Image { .. } => None,
+                    })
+                    .collect();
+                if !parts.is_empty() {
+                    contents.push(json!({ "role": "model", "parts": parts }));
+                }
+            }
+            MessageRole::ToolResult => {
+                let parts: Vec<Value> = msg.content.iter()
+                    .filter_map(|blk| match blk {
+                        ContentBlock::ToolResult { tool_use_id, tool_result, is_error } => {
+                            let name = tool_names.get(tool_use_id).cloned().unwrap_or_default();
+                            let mut response = json!({ "result": tool_result });
+                            if *is_error {
+                                response["isError"] = json!(true);
+                            }
+                            Some(json!({
+                                "functionResponse": { "name": name, "response": response }
+                            }))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                if !parts.is_empty() {
+                    contents.push(json!({ "role": "user", "parts": parts }));
+                }
+            }
         }
     }
     Value::Array(contents)
@@ -66,11 +125,14 @@ fn convert_tools(tools: &[ToolDef]) -> Value {
     json!([{ "function_declarations": function_declarations }])
 }
 
-fn parse_finish_reason(s: Option<&str>) -> StopReason {
+fn parse_finish_reason(s: Option<&str>, has_function_call: bool) -> StopReason {
+    if has_function_call {
+        return StopReason::ToolUse;
+    }
     match s {
-        Some("STOP")           => StopReason::EndTurn,
-        Some("MAX_TOKENS")     => StopReason::MaxTokens,
-        _                      => StopReason::EndTurn,
+        Some("STOP")       => StopReason::EndTurn,
+        Some("MAX_TOKENS") => StopReason::MaxTokens,
+        _                  => StopReason::EndTurn,
     }
 }
 
@@ -110,11 +172,30 @@ impl GeminiProvider {
     }
 
     fn build_body(&self, req: &ChatRequest) -> Value {
+        let mut gen_config = json!({
+            "maxOutputTokens": req.max_tokens,
+        });
+        if let Some(t) = req.temperature {
+            gen_config["temperature"] = json!(t);
+        }
+        if let Some(p) = req.top_p {
+            gen_config["topP"] = json!(p);
+        }
+        if !req.stop.is_empty() {
+            gen_config["stopSequences"] = json!(req.stop);
+        }
+        if req.extended_thinking || req.reasoning_effort.is_some() {
+            let budget = req.thinking_budget
+                .unwrap_or_else(|| effort_to_thinking_budget(req.reasoning_effort.as_deref()));
+            gen_config["thinkingConfig"] = json!({
+                "thinkingBudget": budget,
+                "includeThoughts": true
+            });
+        }
+
         let mut body = json!({
             "contents": convert_messages_to_contents(&req.messages),
-            "generationConfig": {
-                "maxOutputTokens": req.max_tokens,
-            },
+            "generationConfig": gen_config,
         });
         if let Some(sys) = &req.system {
             body["systemInstruction"] = json!({ "parts": [{ "text": sys }] });
@@ -122,12 +203,8 @@ impl GeminiProvider {
         if !req.tools.is_empty() {
             body["tools"] = convert_tools(&req.tools);
         }
-        if let Some(t) = req.temperature {
-            body["generationConfig"]["temperature"] = json!(t);
-        }
         body
     }
-
 }
 
 #[async_trait]
@@ -154,7 +231,6 @@ impl Provider for GeminiProvider {
             .ok_or_else(|| ProviderError::Other("no candidates in response".into()))?;
 
         let finish_reason = candidate["finishReason"].as_str();
-        let stop_reason   = parse_finish_reason(finish_reason);
 
         let usage = Usage {
             input_tokens:          raw["usageMetadata"]["promptTokenCount"].as_u64().unwrap_or(0),
@@ -164,12 +240,22 @@ impl Provider for GeminiProvider {
         };
 
         let mut content_blocks = Vec::new();
+        let mut has_fc = false;
         if let Some(parts) = candidate["content"]["parts"].as_array() {
             for part in parts {
                 if let Some(text) = part["text"].as_str() {
-                    content_blocks.push(ContentBlock::Text { text: text.to_string() });
+                    if part["thought"].as_bool() == Some(true) {
+                        content_blocks.push(ContentBlock::Thinking {
+                            thinking: text.to_string(),
+                            signature: None,
+                            redacted: false,
+                        });
+                    } else {
+                        content_blocks.push(ContentBlock::Text { text: text.to_string() });
+                    }
                 }
                 if let Some(fc) = part.get("functionCall") {
+                    has_fc = true;
                     let name  = fc["name"].as_str().unwrap_or("").to_string();
                     let input = fc["args"].clone();
                     content_blocks.push(ContentBlock::ToolUse {
@@ -181,6 +267,7 @@ impl Provider for GeminiProvider {
             }
         }
 
+        let stop_reason = parse_finish_reason(finish_reason, has_fc);
         let message = Message::new(MessageRole::Assistant, content_blocks);
         Ok(ChatResponse { message, stop_reason, usage, model: req.model.clone() })
     }
@@ -214,6 +301,10 @@ async fn run_gemini_sse<S>(
 {
     tokio::pin!(byte_stream);
     let mut buf = String::new();
+    let mut input_tokens  = 0u64;
+    let mut output_tokens = 0u64;
+    let mut final_stop = StopReason::EndTurn;
+    let mut has_fc = false;
 
     loop {
         tokio::select! {
@@ -238,14 +329,59 @@ async fn run_gemini_sse<S>(
                     let data = match data { Some(d) => d, None => continue };
 
                     let raw: Value = match serde_json::from_str(&data) { Ok(v) => v, Err(_) => continue };
+
+                    if let Some(u) = raw.get("usageMetadata") {
+                        input_tokens  = u["promptTokenCount"].as_u64().unwrap_or(input_tokens);
+                        output_tokens = u["candidatesTokenCount"].as_u64().unwrap_or(output_tokens);
+                    }
+
                     let candidate = match raw["candidates"].as_array().and_then(|a| a.first()) {
                         Some(c) => c.clone(),
                         None => continue,
                     };
+
+                    if let Some(fr) = candidate["finishReason"].as_str() {
+                        if !fr.is_empty() {
+                            final_stop = match fr {
+                                "MAX_TOKENS" => StopReason::MaxTokens,
+                                _            => StopReason::EndTurn,
+                            };
+                        }
+                    }
+
                     if let Some(parts) = candidate["content"]["parts"].as_array() {
                         for part in parts {
                             if let Some(text) = part["text"].as_str() {
-                                let _ = tx.send(StreamEvent::Chunk(StreamChunk::TextDelta { delta: text.to_string() })).await;
+                                if !text.is_empty() {
+                                    if part["thought"].as_bool() == Some(true) {
+                                        let _ = tx.send(StreamEvent::Chunk(
+                                            StreamChunk::ThinkingDelta { delta: text.to_string() },
+                                        )).await;
+                                    } else {
+                                        let _ = tx.send(StreamEvent::Chunk(
+                                            StreamChunk::TextDelta { delta: text.to_string() },
+                                        )).await;
+                                    }
+                                }
+                            }
+                            if let Some(fc) = part.get("functionCall") {
+                                has_fc = true;
+                                let name = fc["name"].as_str().unwrap_or("").to_string();
+                                let args = fc["args"].clone();
+                                let call_id = uuid::Uuid::new_v4().to_string();
+                                let _ = tx.send(StreamEvent::Chunk(StreamChunk::ToolCallStart {
+                                    call_id:   call_id.clone(),
+                                    tool_name: name,
+                                })).await;
+                                let args_str = args.to_string();
+                                let _ = tx.send(StreamEvent::Chunk(StreamChunk::ToolCallInput {
+                                    call_id: call_id.clone(),
+                                    delta:   args_str,
+                                })).await;
+                                let _ = tx.send(StreamEvent::Chunk(StreamChunk::ToolCallDone {
+                                    call_id,
+                                    full_input: args,
+                                })).await;
                             }
                         }
                     }
@@ -253,7 +389,13 @@ async fn run_gemini_sse<S>(
             }
         }
     }
-    let _ = tx.send(StreamEvent::Done { stop_reason: StopReason::EndTurn, usage: Usage::default() }).await;
+    if has_fc {
+        final_stop = StopReason::ToolUse;
+    }
+    let _ = tx.send(StreamEvent::Done {
+        stop_reason: final_stop,
+        usage: Usage { input_tokens, output_tokens, ..Usage::default() },
+    }).await;
 }
 
 fn gemini_known_models() -> Vec<ModelInfo> {
@@ -265,6 +407,24 @@ fn gemini_known_models() -> Vec<ModelInfo> {
             max_output_tokens: 8_192,
             supports_vision: true,
             supports_thinking: false,
+            supports_tools: true,
+        },
+        ModelInfo {
+            id: "gemini-2.0-flash-lite".into(),
+            display_name: "Gemini 2.0 Flash-Lite".into(),
+            context_window: 1_000_000,
+            max_output_tokens: 8_192,
+            supports_vision: true,
+            supports_thinking: false,
+            supports_tools: true,
+        },
+        ModelInfo {
+            id: "gemini-2.5-flash".into(),
+            display_name: "Gemini 2.5 Flash".into(),
+            context_window: 1_000_000,
+            max_output_tokens: 65_536,
+            supports_vision: true,
+            supports_thinking: true,
             supports_tools: true,
         },
         ModelInfo {

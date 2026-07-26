@@ -3,7 +3,7 @@ pub mod claude_code;
 /// 该 provider 的 catalog 条目。
 pub fn catalog_entry() -> crate::catalog::CatalogEntry {
     crate::catalog::CatalogEntry {
-        api_key: None,
+        api_key: Vec::new(),
         name: "Anthropic".into(),
         kind: crate::catalog::ProviderKind::Anthropic,
         base_url: Some("https://api.anthropic.com".into()),
@@ -233,7 +233,11 @@ pub struct AnthropicProvider {
 impl AnthropicProvider {
     /// 使用独立 client（无代理）。便捷构造。
     pub fn new(api_key: impl Into<String>, base_url: Option<String>) -> Self {
-        let client = crate::provider::build_http_client(None, CONNECT_TIMEOUT_SECS);
+        let client = crate::provider::build_http_client_with(
+            None,
+            CONNECT_TIMEOUT_SECS,
+            crate::user_agent::claude_headers(),
+        );
         Self::with_client(client, api_key, base_url)
     }
 
@@ -371,8 +375,7 @@ impl AnthropicProvider {
                 }
             } else {
                 // budget-based：旧模型。effort 此时无专用字段，映射为 budget 趋势。
-                let budget = req.thinking_budget.unwrap_or_else(|| {
-                    // 根据 effort 级别映射默认 budget（off 不走这分支）
+                let budget = req.thinking_budget.unwrap_or(
                     match req.reasoning_effort.as_deref() {
                         Some("max")     => 32_000,
                         Some("xhigh")   => 24_000,
@@ -381,7 +384,7 @@ impl AnthropicProvider {
                         Some("low")     | Some("minimal") => 4_000,
                         _               => DEFAULT_THINKING_BUDGET,
                     }
-                });
+                );
                 body["thinking"] = json!({ "type": "enabled", "budget_tokens": budget, "display": "summarized" });
             }
         }
