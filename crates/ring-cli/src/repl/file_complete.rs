@@ -172,7 +172,7 @@ const MAX_FILE_BYTES: usize = 128 * 1024;
 /// - 安全：只读 cwd 范围内的文件（canonicalize + starts_with）；越界 / 非 UTF-8 / 不存在 → 跳过。
 /// - 大文件按 `MAX_FILE_BYTES` 截断并标注。无可解析引用时返回空串。
 /// - （CC 的 readFileState 去重 / 压缩后引用 v1 先不做。）
-/// @path 引用展开结果：文本附件 + 图片 blocks。
+///   @path 引用展开结果：文本附件 + 图片 blocks。
 pub struct Mentions {
     /// 文本附件拼接（不含原文），原样附加到用户文本后。
     pub text:   String,

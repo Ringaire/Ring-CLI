@@ -247,7 +247,7 @@ impl ChatWidget {
                     }
                 }
                 Some(filter) => {
-                    if b.sub_agent != Some(filter) && b.kind != BubbleKind::System {
+                    if b.sub_agent != Some(filter) {
                         continue;
                     }
                 }

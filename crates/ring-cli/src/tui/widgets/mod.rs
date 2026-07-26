@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+pub mod agent_picker;
 pub mod core;
 pub mod chat;
 pub mod effort_picker;
