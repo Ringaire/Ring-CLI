@@ -91,7 +91,7 @@ pub async fn quick_connect(
     let mut cfg = load_user_config().await;
     let providers = cfg.providers.get_or_insert_with(Default::default);
     let mut pe = ProviderEntry::default();
-    if let Some(k) = api_key.filter(|s| !s.trim().is_empty()) { pe.api_key = Some(k); }
+    if let Some(k) = api_key.filter(|s| !s.trim().is_empty()) { pe.api_key = vec![k]; }
     if let Some(u) = base_url.filter(|s| !s.trim().is_empty()) { pe.base_url = Some(u); }
     providers.insert(provider.to_string(), pe);
     cfg.model = Some(format!("{provider}/{model}"));
@@ -170,10 +170,10 @@ pub async fn logout_provider(
         Some(e) => e,
         None    => return Err(format!("no provider '{provider_id}' in config")),
     };
-    if entry.api_key.is_none() {
+    if entry.api_key.is_empty() {
         return Err(format!("'{provider_id}' has no stored credential (key may be from env var)"));
     }
-    entry.api_key = None;
+    entry.api_key.clear();
     save_config(&cfg).await.map_err(|e| format!("save failed: {e}"))?;
 
     let logged_out_id = provider_id.to_string();
@@ -222,7 +222,7 @@ pub fn list_stored_credentials() -> Vec<(String, String)> {
     };
     let mut result = Vec::new();
     for (id, entry) in &providers {
-        if entry.api_key.is_some() {
+        if !entry.api_key.is_empty() {
             let display = if let Some(t) = &entry.provider_type {
                 format!("{} ({})", id, t)
             } else {

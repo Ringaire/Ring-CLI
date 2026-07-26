@@ -4,7 +4,7 @@ use crate::catalog::{CatalogEntry, ProviderKind};
 
 pub fn catalog_entry() -> CatalogEntry {
     CatalogEntry {
-        api_key: None,
+        api_key: Vec::new(),
         name: "Qwen CN".into(),
         kind: ProviderKind::OpenAiCompatible,
         base_url: Some("https://dashscope.aliyuncs.com/compatible-mode/v1".into()),

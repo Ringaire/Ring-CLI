@@ -54,13 +54,13 @@ pub async fn init_dirs() -> std::io::Result<()> {
     tokio::fs::create_dir_all(paths::logs_dir()).await?;
     tokio::fs::create_dir_all(paths::skills_dir()).await?;
 
-    // Initialize SQLite DB (synchronous, fast)
+    // Initialize session index (JSON file)
     tokio::task::spawn_blocking(|| {
         db::init();
         backfill_from_filesystem();
     })
     .await
-    .map_err(|e| std::io::Error::other(format!("DB init task panicked: {e}")))?;
+    .map_err(|e| std::io::Error::other(format!("index init task panicked: {e}")))?;
 
     Ok(())
 }

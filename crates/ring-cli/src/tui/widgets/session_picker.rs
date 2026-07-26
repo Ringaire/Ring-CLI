@@ -15,6 +15,7 @@ const MAX_VISIBLE: usize = 10;
 pub struct SessionEntry {
     pub id:            Uuid,
     pub title:         String,
+    pub model:         Option<String>,
     pub message_count: usize,
     pub updated_at:    String,
 }
@@ -149,7 +150,8 @@ impl SessionPickerModal {
 
         lines.extend(self.list.render_rows(&self.sessions, dim, |s, rs| {
             let title = if s.title.is_empty() { "(untitled)" } else { &s.title };
-            let line = format!("{} | {} msgs | {}", title, s.message_count, s.updated_at);
+            let model_tag = s.model.as_deref().unwrap_or("?");
+            let line = format!("{} | {} | {} msgs | {}", title, model_tag, s.message_count, s.updated_at);
             Line::from(vec![pointer(rs.selected), label(rs.selected, line)])
         }));
 

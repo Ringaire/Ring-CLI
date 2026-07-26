@@ -4,7 +4,7 @@ use crate::catalog::{CatalogEntry, ProviderKind};
 
 pub fn catalog_entry() -> CatalogEntry {
     CatalogEntry {
-        api_key: None,
+        api_key: Vec::new(),
         name: "Xiaomi SGP".into(),
         kind: ProviderKind::OpenAiCompatible,
         base_url: Some("https://api-sgp.miaomi.ai/v1".into()),

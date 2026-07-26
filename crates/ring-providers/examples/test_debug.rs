@@ -10,7 +10,7 @@ fn main() {
     println!("Catalog has {} providers", cat.len());
     if let Some(entry) = cat.get("anthropic-s2a") {
         println!("  anthropic-s2a: api_key={:?}, api_key_env={:?}",
-            entry.api_key.as_ref().map(|k| k.len()),
+            entry.api_key.first().map(|k| k.len()),
             entry.api_key_env
         );
     }

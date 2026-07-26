@@ -4,7 +4,7 @@ use crate::catalog::{CatalogEntry, ProviderKind};
 
 pub fn catalog_entry() -> CatalogEntry {
     CatalogEntry {
-        api_key: None,
+        api_key: Vec::new(),
         name: "MiniMax CN".into(),
         kind: ProviderKind::OpenAiCompatible,
         base_url: Some("https://api.minimaxi.chat/v1".into()),

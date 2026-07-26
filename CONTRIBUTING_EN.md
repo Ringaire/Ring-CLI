@@ -13,7 +13,7 @@ Thanks for your interest in RingCLI! This document explains how to get involved.
 - An LLM API key (for testing)
 
 ```bash
-git clone https://github.com/Ringaire/RingCLI.git
+git clone https://github.com/Ringaire/Ring-CLI.git
 cd RingCLI
 cargo build
 ```

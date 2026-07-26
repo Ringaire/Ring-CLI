@@ -4,7 +4,7 @@ use crate::catalog::{CatalogEntry, ProviderKind};
 
 pub fn catalog_entry() -> CatalogEntry {
     CatalogEntry {
-        api_key: None,
+        api_key: Vec::new(),
         name: "ZAI Coding CN".into(),
         kind: ProviderKind::OpenAiCompatible,
         base_url: Some("https://api-cn.z-ai.io/v1".into()),

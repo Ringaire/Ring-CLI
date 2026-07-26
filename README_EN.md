@@ -8,7 +8,7 @@ English | [简体中文](README.md)
 
 (The project is in its initial stage; version stays 0.x.x before official release. Follows [Semantic Versioning 2.0](https://semver.org/))
 
-[![Version](https://img.shields.io/badge/version-0.1.0-blue.svg)](https://github.com/Ringaire/RingCLI)
+[![Version](https://img.shields.io/badge/version-0.1.0-blue.svg)](https://github.com/Ringaire/Ring-CLI)
 [![Rust](https://img.shields.io/badge/rust-1.85+-orange.svg)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-orange.svg)](LICENSE)
 
@@ -24,7 +24,7 @@ An extensible terminal AI coding assistant supporting **34 LLM providers**, with
 
 ```bash
 # Build from source (requires Rust 1.85+)
-git clone https://github.com/Ringaire/RingCLI.git
+git clone https://github.com/Ringaire/Ring-CLI.git
 cd RingCLI
 cargo install --path crates/ring-cli --bin ring
 

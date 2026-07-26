@@ -4,7 +4,7 @@ use anyhow::Result;
 use crossterm::{
     event::{
         DisableBracketedPaste, EnableBracketedPaste,
-        Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
+        Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -38,11 +38,12 @@ use super::widgets::{
     effort_picker::EffortPickerModal,
     logout_picker::LogoutPickerModal,
     refresh_model_picker::RefreshModelPickerModal,
-    settings_picker::{SettingsPickerModal, SettingsSnapshot, SettingKind},
     model_picker::ModelPickerModal,
+    agent_picker::{AgentPickerModal, AgentEntry},
     permission::PermissionModal,
     provider_setup::{ProviderRow, ProviderSetupModal, SetupAction},
     session_picker::{SessionEntry, SessionPickerModal},
+    settings_picker::{SettingsPickerModal, SettingsSnapshot, SettingKind},
     suggestions,
     tasks,
     welcome::render_welcome,
@@ -65,6 +66,66 @@ fn sub_agent_ids(chat: &ChatWidget) -> Vec<uuid::Uuid> {
     ids
 }
 
+fn resolve_context_window(model: &str) -> u64 {
+    ring_providers::models_dev::resolve_meta(model)
+        .and_then(|m| m.context_window)
+        .filter(|&w| w > 0)
+        .unwrap_or(DEFAULT_CONTEXT_WINDOW)
+}
+
+const PASTE_BURST_MIN_CHARS: u32 = 8;
+const PASTE_BURST_CHAR_INTERVAL_MS: i64 = 8;
+const PASTE_BURST_ACTIVE_IDLE_MS: i64 = 30;
+const PASTE_ENTER_SUPPRESS_MS: i64 = 120;
+
+struct PasteBurst {
+    last_char_ms:       Option<i64>,
+    consecutive_chars:  u32,
+    active_until:       i64,
+    enter_suppress_until: i64,
+}
+
+impl PasteBurst {
+    fn new() -> Self {
+        Self { last_char_ms: None, consecutive_chars: 0, active_until: 0, enter_suppress_until: 0 }
+    }
+
+    fn on_plain_char(&mut self, now: i64) {
+        if let Some(last) = self.last_char_ms {
+            if now - last <= PASTE_BURST_CHAR_INTERVAL_MS {
+                self.consecutive_chars += 1;
+            } else {
+                self.consecutive_chars = 1;
+            }
+        } else {
+            self.consecutive_chars = 1;
+        }
+        self.last_char_ms = Some(now);
+        if self.consecutive_chars >= PASTE_BURST_MIN_CHARS {
+            self.active_until = now + PASTE_BURST_ACTIVE_IDLE_MS;
+            self.enter_suppress_until = now + PASTE_ENTER_SUPPRESS_MS;
+        }
+    }
+
+    fn should_insert_newline(&self, now: i64) -> bool {
+        if now <= self.active_until || now <= self.enter_suppress_until {
+            return true;
+        }
+        if let Some(last) = self.last_char_ms {
+            self.consecutive_chars >= PASTE_BURST_MIN_CHARS && now - last <= PASTE_BURST_CHAR_INTERVAL_MS
+        } else {
+            false
+        }
+    }
+
+    fn reset(&mut self) {
+        self.last_char_ms = None;
+        self.consecutive_chars = 0;
+        self.active_until = 0;
+        self.enter_suppress_until = 0;
+    }
+}
+
 struct AppState {
     model:            String,
     mode:             String,
@@ -80,6 +141,7 @@ struct AppState {
     input:            InputWidget,
     pending:          Option<PendingPermission>,
     model_picker:     Option<ModelPickerModal>,
+    agent_picker:     Option<AgentPickerModal>,
     mode_picker:      Option<ModePickerModal>,
     effort_picker:    Option<EffortPickerModal>,
     logout_picker:    Option<LogoutPickerModal>,
@@ -119,6 +181,8 @@ struct AppState {
     rename_input:     Option<super::widgets::session_picker::RenameState>,
     /// 会话操作待确认：删除/fork 需二次确认
     session_action:   Option<super::widgets::session_picker::SessionAction>,
+    /// 粘贴突发检测器
+    paste_burst:      PasteBurst,
 }
 
 impl AppState {
@@ -146,6 +210,7 @@ impl AppState {
             input:            InputWidget::new(),
             pending:          None,
             model_picker:     None,
+            agent_picker:     None,
             mode_picker:      None,
             effort_picker:    None,
             logout_picker:    None,
@@ -172,6 +237,7 @@ impl AppState {
             active_sub_agent: None,
             rename_input:     None,
             session_action:   None,
+            paste_burst:      PasteBurst::new(),
         }
     }
 
@@ -387,7 +453,7 @@ async fn run_loop<B: ratatui::backend::Backend>(
                 finish_turn(&mut state, result);
                 // Auto-compact：上下文占用 ≥ 80% 时自动压缩
                 if state.tokens > 0 && state.context_window > 0
-                    && state.tokens * 100 / state.context_window >= 80
+                    && state.tokens * 100 / state.context_window >= 85
                 {
                     compact_tui(runtime, &ctx, &mut state).await;
                 }
@@ -474,15 +540,16 @@ async fn handle_term_event(
         Event::Paste(text) => {
             if state.pending.is_none() {
                 if let Some(m) = &mut state.provider_setup {
-                    // provider 向导激活：粘贴到向导输入框（API key 等）
                     m.insert_str(&text);
                 } else if let Some(picker) = &mut state.model_picker {
-                    // model picker 激活：粘贴到搜索过滤器
                     picker.append_filter(&text);
-                } else if state.mode_picker.is_none() && state.session_picker.is_none() && state.effort_picker.is_none() && state.logout_picker.is_none() && state.refresh_model_picker.is_none() && state.settings_picker.is_none() {
-                    // 正常输入框
+                } else if state.mode_picker.is_none() && state.session_picker.is_none() && state.effort_picker.is_none() && state.logout_picker.is_none() && state.refresh_model_picker.is_none() && state.settings_picker.is_none() && state.agent_picker.is_none() {
                     let processed = crate::repl::file_complete::process_paste(&text);
                     state.input.insert_str(&processed);
+                    let now = chrono::Utc::now().timestamp_millis();
+                    for _ in 0..processed.chars().count().min(16) {
+                        state.paste_burst.on_plain_char(now);
+                    }
                 }
             }
             Control::Continue
@@ -509,6 +576,10 @@ async fn handle_term_event(
             if state.model_picker.is_some() {
                 return handle_model_picker_key(ke, runtime, ctx, state).await;
             }
+            // agent 选择器优先处理按键
+            if state.agent_picker.is_some() {
+                return handle_agent_picker_key(ke, state).await;
+            }
             // 模式选择器优先处理按键
             if state.mode_picker.is_some() {
                 return handle_mode_picker_key(ke, runtime, state).await;
@@ -530,14 +601,6 @@ async fn handle_term_event(
                 return handle_settings_picker_key(ke, runtime, state).await;
             }
             handle_key(ke, runtime, ctx, state, history, perm_tx, done_tx, picker_tx).await
-        }
-        Event::Mouse(me) => {
-            match me.kind {
-                MouseEventKind::ScrollUp   => { state.chat.scroll_up(3); }
-                MouseEventKind::ScrollDown => { state.chat.scroll_down(3); }
-                _ => {}
-            }
-            Control::Continue
         }
         _ => Control::Continue,
     }
@@ -654,6 +717,37 @@ async fn handle_model_picker_key(
 }
 
 /// 模式选择器按键处理。
+async fn handle_agent_picker_key(
+    ke:    KeyEvent,
+    state: &mut AppState,
+) -> Control {
+    match ke.code {
+        KeyCode::Up => {
+            if let Some(picker) = &mut state.agent_picker {
+                picker.move_up();
+            }
+        }
+        KeyCode::Down => {
+            if let Some(picker) = &mut state.agent_picker {
+                picker.move_down();
+            }
+        }
+        KeyCode::Enter => {
+            if let Some(picker) = state.agent_picker.take() {
+                if let Some(id) = picker.selected_id() {
+                    state.active_sub_agent = Some(id);
+                    state.chat.scroll_offset = 0;
+                }
+            }
+        }
+        KeyCode::Esc => {
+            state.agent_picker = None;
+        }
+        _ => {}
+    }
+    Control::Continue
+}
+
 async fn handle_mode_picker_key(
     ke:      KeyEvent,
     runtime: &mut BootstrappedRuntime,
@@ -1145,7 +1239,7 @@ async fn finish_setup(
     let mut cfg = ring_core::load_user_config().await;
     let providers = cfg.providers.get_or_insert_with(Default::default);
     let mut entry = ring_core::ProviderEntry::default();
-    if !api_key.is_empty() { entry.api_key = Some(api_key); }
+    if !api_key.is_empty() { entry.api_key = vec![api_key]; }
     if is_custom { entry.base_url = base_url; }   // preset 的 base_url 来自 catalog，不入库
     providers.insert(provider_id.clone(), entry);
     cfg.model = Some(format!("{provider_id}/{model}"));
@@ -1162,6 +1256,7 @@ async fn finish_setup(
                 g.system = Some(runtime.system_prompt.clone());
             }
             state.model = model.clone();
+            state.context_window = resolve_context_window(&model);
             state.chat.add_system(format!("Connected — switched to {provider_id}/{model}"));
             state.provider_setup = None;
         }
@@ -1188,6 +1283,7 @@ async fn quick_connect(
                 g.system = Some(runtime.system_prompt.clone());
             }
             state.model = model.clone();
+            state.context_window = resolve_context_window(&model);
             state.chat.add_system(format!("Connected — switched to {provider}/{model}"));
         }
         ConnectResult::Rejected(msg) => state.chat.add_error(None, msg),
@@ -1328,8 +1424,8 @@ async fn handle_key(
         }
         KeyCode::Esc => {
             if state.active_sub_agent.is_some() {
-                // 从子 agent 视图切回主视图
                 state.active_sub_agent = None;
+                state.chat.scroll_offset = 0;
             } else if state.is_running {
                 if let Some(sig) = &state.signal {
                     sig.cancel();
@@ -1352,6 +1448,12 @@ async fn handle_key(
             state.input.insert_newline();
         }
         KeyCode::Enter => {
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            if state.paste_burst.should_insert_newline(now_ms) {
+                state.input.insert_newline();
+                return Control::Continue;
+            }
+
             // 补全可见且仍在敲命令名（无空格）且未敲完整 → Enter 先接受补全
             let accept_suggestion = !state.suggestions.is_empty()
                 && !state.input.value.contains(char::is_whitespace)
@@ -1409,6 +1511,7 @@ async fn handle_key(
         // 仅插入无修饰键的可见字符；任何 Ctrl/Alt 组合（如 Ctrl+H/Ctrl+A）都不应漏插字母。
         KeyCode::Char(c) if !ctrl && !alt => {
             state.input.insert_char(c);
+            state.paste_burst.on_plain_char(chrono::Utc::now().timestamp_millis());
         }
         KeyCode::Backspace => {
             state.input.backspace();
@@ -1445,6 +1548,7 @@ async fn handle_key(
                     }
                 };
                 state.active_sub_agent = next;
+                state.chat.scroll_offset = 0;
             }
         }
         KeyCode::Down if ctrl => {
@@ -1461,6 +1565,7 @@ async fn handle_key(
                     }
                 };
                 state.active_sub_agent = next;
+                state.chat.scroll_offset = 0;
             }
         }
         KeyCode::Up => {
@@ -1468,7 +1573,6 @@ async fn handle_key(
                 let n = state.suggestions.len();
                 state.suggestion_idx = (state.suggestion_idx + n - 1) % n;
             } else if !state.input.is_empty() {
-                // 输入框有内容：多行光标上移
                 state.input.move_up();
             } else if let Some(prev) = history.prev() {
                 state.input.set(prev);
@@ -1479,10 +1583,22 @@ async fn handle_key(
                 let n = state.suggestions.len();
                 state.suggestion_idx = (state.suggestion_idx + 1) % n;
             } else if !state.input.is_empty() {
-                // 输入框有内容：多行光标下移
                 state.input.move_down();
-            } else if let Some(next) = history.next() {
-                state.input.set(next);
+            } else {
+                let ids = sub_agent_ids(&state.chat);
+                if !ids.is_empty() && state.agent_picker.is_none() {
+                    let entries: Vec<AgentEntry> = ids.iter().map(|id| {
+                        AgentEntry {
+                            id: *id,
+                            label: id.to_string()[..8].to_string(),
+                            model: "agent".to_string(),
+                            running: state.is_running,
+                        }
+                    }).collect();
+                    state.agent_picker = Some(AgentPickerModal::new(entries));
+                } else if let Some(next) = history.next() {
+                    state.input.set(next);
+                }
             }
         }
         KeyCode::PageUp if ctrl => { state.chat.scroll_up(30); }  // Ctrl+PgUp: 快速上翻
@@ -1709,12 +1825,15 @@ async fn handle_command(
             };
             runtime.session = new_session;
             state.chat = ChatWidget::new();
+            state.tokens = 0;
+            state.paste_burst.reset();
             state.load_history_messages(&messages);
             state.chat.add_system("Started new conversation");
             CmdResult::Handled
         }
         CommandOutcome::Clear => {
             state.chat = ChatWidget::new();
+            state.tokens = 0;
             CmdResult::Handled
         }
         CommandOutcome::Compact => {
@@ -1734,6 +1853,7 @@ async fn handle_command(
                 SessionEntry {
                     id: s.id,
                     title: s.title.unwrap_or_default(),
+                    model: s.model,
                     message_count: s.message_count,
                     updated_at: when,
                 }
@@ -1892,6 +2012,7 @@ async fn switch_model(
                 g.system = Some(runtime.system_prompt.clone());
             }
             state.model = model.clone();
+            state.context_window = resolve_context_window(&model);
             state.chat.add_system(format!("switched to {provider}/{model}"));
         }
         SwitchResult::ModelOnly { model } => {
@@ -1901,6 +2022,7 @@ async fn switch_model(
                 g.system = Some(runtime.system_prompt.clone());
             }
             state.model = model.clone();
+            state.context_window = resolve_context_window(&model);
             state.chat.add_system(format!("model switched to {model}"));
         }
         SwitchResult::ProviderMissing { provider } => {
@@ -2045,6 +2167,7 @@ async fn resume_session_tui(
             };
             runtime.session = s;
             state.chat = ChatWidget::new();
+            state.active_sub_agent = None;
             state.load_history_messages(&messages);
             state.chat.add_system(format!(
                 "Resumed session {} ({} messages)", id, messages.len()
@@ -2106,6 +2229,7 @@ async fn fork_session_tui(
             };
             runtime.session = new_session;
             state.chat = ChatWidget::new();
+            state.active_sub_agent = None;
             state.load_history_messages(&messages);
             state.chat.add_system(format!(
                 "forked {} → {} ({} messages)",
@@ -2131,6 +2255,7 @@ async fn refresh_session_picker(state: &mut AppState) {
         SessionEntry {
             id: s.id,
             title: s.title.unwrap_or_default(),
+            model: s.model,
             message_count: s.message_count,
             updated_at: when,
         }
@@ -2219,6 +2344,8 @@ fn draw<B: ratatui::backend::Backend>(term: &mut Terminal<B>, state: &mut AppSta
             frame.render_widget(p.modal.render(), zone_area);
         } else if let Some(picker) = &state.model_picker {
             frame.render_widget(picker.render(), zone_area);
+        } else if let Some(picker) = &state.agent_picker {
+            frame.render_widget(picker.render(), zone_area);
         } else if let Some(picker) = &state.mode_picker {
             frame.render_widget(picker.render(), zone_area);
         } else if let Some(picker) = &state.effort_picker {
@@ -2249,7 +2376,7 @@ fn draw<B: ratatui::backend::Backend>(term: &mut Terminal<B>, state: &mut AppSta
 
         // cursor（picker/向导/权限激活时隐藏；仅 suggestions 时仍在输入框内）
         if state.pending.is_none() && state.session_picker.is_none()
-            && state.model_picker.is_none() && state.mode_picker.is_none() && state.effort_picker.is_none() && state.logout_picker.is_none() && state.refresh_model_picker.is_none() && state.settings_picker.is_none()
+            && state.model_picker.is_none() && state.agent_picker.is_none() && state.mode_picker.is_none() && state.effort_picker.is_none() && state.logout_picker.is_none() && state.refresh_model_picker.is_none() && state.settings_picker.is_none()
             && state.provider_setup.is_none()
         {
             let (cx, cy) = state.input.cursor_screen_pos(input_area);
@@ -2258,6 +2385,7 @@ fn draw<B: ratatui::backend::Backend>(term: &mut Terminal<B>, state: &mut AppSta
 
         // 任务面板（Ctrl+T）：无下拉菜单时锚定输入框上方
         let no_menu = state.pending.is_none() && state.model_picker.is_none()
+            && state.agent_picker.is_none()
             && state.mode_picker.is_none() && state.effort_picker.is_none() && state.logout_picker.is_none() && state.refresh_model_picker.is_none() && state.settings_picker.is_none()
             && state.session_picker.is_none() && state.provider_setup.is_none()
             && !show_suggestions;
@@ -2316,20 +2444,20 @@ fn render_hint<'a>(state: &'a AppState) -> ratatui::widgets::Paragraph<'a> {
 
     let hint = if let Some(id) = state.active_sub_agent {
         // 子 agent 视图
-        format!("⟳ sub-agent {} · ↓ cycle · Esc back to main", &id.to_string()[..8])
+        format!("⟳ sub-agent {} · Esc back to main", &id.to_string()[..8])
     } else if let Some(ls) = &state.loop_state {
         // 循环模式
         format!("⟳ loop {}/{} · {} · esc to stop", ls.current_turn, ls.max_turns, ls.goal)
     } else if state.is_running {
         if !sub_ids.is_empty() {
-            format!("{} agent(s) active · ↓ to view · esc to interrupt", sub_ids.len())
+            format!("{} agent(s) active · ↓ to manage · esc to interrupt", sub_ids.len())
         } else {
             "esc to interrupt".to_string()
         }
     } else if !state.queued_messages.is_empty() {
         format!("{} queued · Enter to send", state.queued_messages.len())
     } else if !sub_ids.is_empty() {
-        format!("{} sub-agent(s) · ↓ to review · ? help · / commands · @ files", sub_ids.len())
+        format!("{} sub-agent(s) · ↓ to manage · ? help · / commands · @ files", sub_ids.len())
     } else {
         "? help · Tab mode · / commands · @ files".to_string()
     };

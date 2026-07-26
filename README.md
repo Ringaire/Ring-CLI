@@ -8,7 +8,7 @@
 
 (项目处于初始阶段，版本号在正式发布前保持 0.x.x。遵循 [语义化版本 2.0](https://semver.org/lang/zh-CN/))
 
-[![Version](https://img.shields.io/badge/version-0.1.0-blue.svg)](https://github.com/Ringaire/RingCLI)
+[![Version](https://img.shields.io/badge/version-0.1.0-blue.svg)](https://github.com/Ringaire/Ring-CLI)
 [![Rust](https://img.shields.io/badge/rust-1.85+-orange.svg)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-orange.svg)](LICENSE)
 
@@ -24,9 +24,9 @@
 
 ```bash
 # 从源码构建（需要 Rust 1.85+）
-git clone https://github.com/Ringaire/RingCLI.git
+git clone https://github.com/Ringaire/Ring-CLI.git
 cd RingCLI
-cargo install --path crates/ring-cli --bin ring
+cargo install --path crates/ring-cli 
 
 # 或直接运行
 cargo run --release

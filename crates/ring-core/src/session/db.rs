@@ -1,251 +1,153 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use rusqlite::{params, Connection, OptionalExtension};
 use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::session::paths;
 use crate::session::SessionMeta;
 
-const SCHEMA_VERSION: i32 = 1;
+// ── JSON 索引文件路径 ────────────────────────────────────────────────────────
 
-fn db_path() -> PathBuf {
-    paths::ring_home().join("state.sqlite")
+fn index_path() -> PathBuf {
+    paths::sessions_dir().join("index.json")
 }
 
-type DbConn = Arc<Mutex<Connection>>;
+// ── 内存索引（进程生命周期内缓存）────────────────────────────────────────────
 
-static DB: OnceLock<DbConn> = OnceLock::new();
+type Index = Arc<Mutex<Vec<SessionMeta>>>;
+
+static INDEX: OnceLock<Index> = OnceLock::new();
+
+fn index() -> &'static Index {
+    INDEX.get().expect("session index not initialized -- call init() first")
+}
+
+// ── 初始化 ───────────────────────────────────────────────────────────────────
 
 pub fn init() {
-    DB.get_or_init(|| {
-        let path = db_path();
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-
-        let conn = Connection::open(&path).unwrap_or_else(|e| {
-            panic!("Failed to open session DB at {}: {e}", path.display())
-        });
-
-        configure_pragmas(&conn);
-        run_migrations(&conn);
-
-        debug!("session DB initialized at {}", path.display());
-        Arc::new(Mutex::new(conn))
+    INDEX.get_or_init(|| {
+        let entries = load_from_disk();
+        debug!("session index loaded: {} entries", entries.len());
+        Arc::new(Mutex::new(entries))
     });
 }
 
-fn configure_pragmas(conn: &Connection) {
-    const PRAGMAS: &[(&str, &str)] = &[
-        ("journal_mode", "WAL"),
-        ("synchronous", "NORMAL"),
-        ("busy_timeout", "5000"),
-        ("foreign_keys", "ON"),
-        ("auto_vacuum", "INCREMENTAL"),
-    ];
-    for (key, val) in PRAGMAS {
-        if let Err(e) = conn.pragma_update(None, key, val) {
-            warn!("session DB: PRAGMA {key}={val} failed: {e}");
+fn load_from_disk() -> Vec<SessionMeta> {
+    let path = index_path();
+    match std::fs::read_to_string(&path) {
+        Ok(raw) => serde_json::from_str(&raw).unwrap_or_else(|e| {
+            warn!("failed to parse session index: {e}, starting fresh");
+            Vec::new()
+        }),
+        Err(_) => Vec::new(),
+    }
+}
+
+fn flush_to_disk(entries: &[SessionMeta]) {
+    let path = index_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    // 原子写入：先写临时文件，再 rename
+    let tmp = path.with_extension("json.tmp");
+    match serde_json::to_vec_pretty(entries) {
+        Ok(data) => {
+            if let Err(e) = std::fs::write(&tmp, &data) {
+                warn!("failed to write session index tmp: {e}");
+                return;
+            }
+            if let Err(e) = std::fs::rename(&tmp, &path) {
+                warn!("failed to rename session index: {e}");
+                let _ = std::fs::remove_file(&tmp);
+            }
         }
+        Err(e) => warn!("failed to serialize session index: {e}"),
     }
 }
 
-fn run_migrations(conn: &Connection) {
-    let current: i32 = conn
-        .query_row("SELECT user_version FROM pragma_user_version", [], |row| {
-            row.get(0)
-        })
-        .unwrap_or(0);
-
-    if current >= SCHEMA_VERSION {
-        debug!("session DB schema v{current}, up to date");
-        return;
-    }
-
-    debug!("session DB migrating v{current} -> v{SCHEMA_VERSION}");
-
-    if current < 1 {
-        conn.execute_batch(
-            r#"
-            CREATE TABLE IF NOT EXISTS threads (
-                id            TEXT PRIMARY KEY,
-                title         TEXT,
-                cwd           TEXT NOT NULL,
-                created_at    INTEGER NOT NULL,
-                updated_at    INTEGER NOT NULL,
-                message_count INTEGER NOT NULL DEFAULT 0,
-                model         TEXT,
-                archived      INTEGER NOT NULL DEFAULT 0,
-                compressed    INTEGER NOT NULL DEFAULT 0
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_threads_updated_at
-                ON threads (updated_at DESC);
-
-            CREATE INDEX IF NOT EXISTS idx_threads_archived
-                ON threads (archived);
-            "#,
-        )
-        .expect("session DB migration v1 failed");
-    }
-
-    conn.pragma_update(None, "user_version", SCHEMA_VERSION)
-        .expect("failed to set user_version");
-}
-
-fn conn() -> &'static DbConn {
-    DB.get().expect("session DB not initialized -- call init() first")
-}
-
-// ── 公共 API ──────────────────────────────────────────────────────────────────
+// ── 公共 API（与原 SQLite 版本保持一致）──────────────────────────────────────
 
 pub fn upsert_thread(meta: &SessionMeta) {
-    let c = conn();
-    let guard = c.lock().unwrap();
-    let id = meta.id.to_string();
-    let title = meta.title.as_deref().unwrap_or("");
-    let cwd = meta.cwd.to_string_lossy();
-    let model = meta.model.as_deref().unwrap_or("");
+    let idx = index();
+    let mut entries = idx.lock().unwrap();
 
-    let _ = guard.execute(
-        "INSERT OR REPLACE INTO threads
-            (id, title, cwd, created_at, updated_at, message_count, model, archived, compressed)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7,
-                 (SELECT archived   FROM threads WHERE id = ?1),
-                 (SELECT compressed FROM threads WHERE id = ?1))",
-        params![
-            id,
-            title,
-            cwd,
-            meta.created_at,
-            meta.updated_at,
-            meta.message_count as i64,
-            model,
-        ],
-    );
+    if let Some(existing) = entries.iter_mut().find(|e| e.id == meta.id) {
+        *existing = meta.clone();
+    } else {
+        entries.push(meta.clone());
+    }
+
+    flush_to_disk(&entries);
 }
 
 pub fn delete_thread(id: Uuid) {
-    let c = conn();
-    let guard = c.lock().unwrap();
-    let _ = guard.execute(
-        "DELETE FROM threads WHERE id = ?1",
-        params![id.to_string()],
-    );
+    let idx = index();
+    let mut entries = idx.lock().unwrap();
+    let before = entries.len();
+    entries.retain(|e| e.id != id);
+
+    if entries.len() < before {
+        flush_to_disk(&entries);
+    }
 }
 
 pub fn get_thread(id: Uuid) -> Option<SessionMeta> {
-    let c = conn();
-    let guard = c.lock().unwrap();
-    guard
-        .query_row(
-            "SELECT id, title, cwd, created_at, updated_at, message_count, model
-             FROM threads WHERE id = ?1",
-            params![id.to_string()],
-            row_to_meta,
-        )
-        .optional()
-        .ok()
-        .flatten()
+    let idx = index();
+    let entries = idx.lock().unwrap();
+    entries.iter().find(|e| e.id == id).cloned()
 }
 
 pub fn list_threads(limit: i64) -> Vec<SessionMeta> {
-    let c = conn();
-    let Ok(guard) = c.lock() else {
-        return Vec::new();
-    };
+    let idx = index();
+    let entries = idx.lock().unwrap();
 
-    let Ok(mut stmt) = guard.prepare(
-        "SELECT id, title, cwd, created_at, updated_at, message_count, model
-         FROM threads
-         WHERE archived = 0
-         ORDER BY updated_at DESC
-         LIMIT ?1",
-    ) else {
-        return Vec::new();
-    };
-
-    stmt.query_map(params![limit], row_to_meta)
-        .ok()
-        .map(|rows| rows.filter_map(|r| r.ok()).collect())
-        .unwrap_or_default()
+    let mut sorted: Vec<SessionMeta> = entries
+        .iter()
+        .cloned()
+        .collect();
+    sorted.sort_by_key(|e| std::cmp::Reverse(e.updated_at));
+    sorted.truncate(limit as usize);
+    sorted
 }
 
 pub fn search_threads(query: &str) -> Vec<SessionMeta> {
-    let c = conn();
-    let Ok(guard) = c.lock() else {
-        return Vec::new();
-    };
+    let idx = index();
+    let entries = idx.lock().unwrap();
+    let lower = query.to_lowercase();
 
-    let pattern = format!("%{query}%");
+    let mut matched: Vec<SessionMeta> = entries
+        .iter()
+        .filter(|e| {
+            e.title
+                .as_deref()
+                .map(|t| t.to_lowercase().contains(&lower))
+                .unwrap_or(false)
+        })
+        .cloned()
+        .collect();
 
-    let Ok(mut stmt) = guard.prepare(
-        "SELECT id, title, cwd, created_at, updated_at, message_count, model
-         FROM threads
-         WHERE archived = 0 AND title LIKE ?1
-         ORDER BY updated_at DESC
-         LIMIT 100",
-    ) else {
-        return Vec::new();
-    };
-
-    stmt.query_map(params![pattern], row_to_meta)
-        .ok()
-        .map(|rows| rows.filter_map(|r| r.ok()).collect())
-        .unwrap_or_default()
+    matched.sort_by_key(|e| std::cmp::Reverse(e.updated_at));
+    matched.truncate(100);
+    matched
 }
 
 pub fn set_compressed(id: Uuid, compressed: bool) {
-    let c = conn();
-    let guard = c.lock().unwrap();
-    let _ = guard.execute(
-        "UPDATE threads SET compressed = ?1 WHERE id = ?2",
-        params![compressed as i64, id.to_string()],
-    );
+    // JSON 索引不追踪压缩状态 — 由文件系统 (.zst 后缀) 自描述。
+    // 保留签名兼容，compression.rs 调用时不报错。
+    let _ = (id, compressed);
 }
 
 pub fn set_archived(id: Uuid, archived: bool) {
-    let c = conn();
-    let guard = c.lock().unwrap();
-    let _ = guard.execute(
-        "UPDATE threads SET archived = ?1 WHERE id = ?2",
-        params![archived as i64, id.to_string()],
-    );
+    if archived {
+        delete_thread(id);
+    }
+    let _ = archived;
 }
 
 pub fn count() -> usize {
-    let c = conn();
-    let guard = c.lock().unwrap();
-    guard
-        .query_row("SELECT COUNT(*) FROM threads", [], |row| {
-            row.get::<_, i64>(0)
-        })
-        .map(|n| n as usize)
-        .unwrap_or(0)
-}
-
-// ── helpers ───────────────────────────────────────────────────────────────────
-
-fn row_to_meta(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionMeta> {
-    let id_str: String = row.get(0)?;
-    let title: String = row.get(1)?;
-    let cwd_str: String = row.get(2)?;
-    let created_at: i64 = row.get(3)?;
-    let updated_at: i64 = row.get(4)?;
-    let message_count: i64 = row.get(5)?;
-    let model: String = row.get(6)?;
-
-    let id = Uuid::parse_str(&id_str).unwrap_or_default();
-
-    Ok(SessionMeta {
-        id,
-        title: if title.is_empty() { None } else { Some(title) },
-        cwd: PathBuf::from(cwd_str),
-        created_at,
-        updated_at,
-        message_count: message_count as usize,
-        model: if model.is_empty() { None } else { Some(model) },
-    })
+    let idx = index();
+    let entries = idx.lock().unwrap();
+    entries.len()
 }

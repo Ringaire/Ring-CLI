@@ -17,7 +17,7 @@ fn main() {
         if id.contains("anthropic") || id.contains("openai") {
             println!("  {}: api_key={:?}, api_key_env={:?}",
                 id,
-                entry.api_key.as_ref().map(|k| format!("{}...", &k[..10.min(k.len())])),
+                entry.api_key.first().map(|k| format!("{}...", &k[..10.min(k.len())])),
                 entry.api_key_env
             );
         }

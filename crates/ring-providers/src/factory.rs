@@ -6,11 +6,13 @@ use std::path::PathBuf;
 use tracing::{debug, info, warn};
 
 use ring_core::config::ResolvedConfig;
+use ring_core::config::auth::{self, AuthStore};
 use ring_core::session::paths;
 
 use crate::catalog::{self, ProviderKind};
 use crate::provider::{build_http_client, DEFAULT_CONNECT_TIMEOUT_SECS};
 use crate::providers::{
+    added::ollama::OllamaProvider,
     anthropic::AnthropicProvider,
     anthropic::claude_code::ClaudeCodeProvider,
     compatible::CompatibleProvider,
@@ -39,19 +41,24 @@ pub fn build_registry(config: &ResolvedConfig) -> ProviderBootstrap {
     // 加载 catalog（内置 + 全局 + 项目）
     let global_dir = paths::config_dir();
     let project_dir = std::env::current_dir().ok();
-    let cat = catalog::load(
+    let mut cat = catalog::load(
         Some(&global_dir),
         project_dir.as_deref(),
     );
+
+    merge_config_providers(&mut cat, &config.providers);
+
+    let auth_store: Option<AuthStore> = auth::load_auth_store();
 
     let mut registry = ProviderRegistry::new();
 
     // ── 1. 遍历 catalog，注册所有可用的 provider ───────────────────────────
     for (id, entry) in &cat {
-        // 解析 api_key：catalog 直接提供，或从 env 读取
-        let api_key = entry.api_key.clone()
+        let api_key = entry.api_key.first()
             .filter(|k| !k.trim().is_empty())
+            .cloned()
             .or_else(|| entry.api_key_env.as_deref().and_then(|env| std::env::var(env).ok()))
+            .or_else(|| auth_store.as_ref().and_then(|s| auth::get_api_key(s, id).map(|k| k.to_string())))
             .unwrap_or_default();
 
         // 内置 provider 需要 key 但没有提供 → 跳过
@@ -166,6 +173,19 @@ fn register_one(params: RegisterParams) {
             ));
             debug!(provider = %id, "registered openai-compatible");
         }
+        ProviderKind::OllamaNative => {
+            let num_ctx = extra_body
+                .as_ref()
+                .and_then(|e| e["options"]["num_ctx"].as_u64())
+                .map(|v| v as u32);
+            registry.register(OllamaProvider::with_client(
+                client.clone(),
+                base_url,
+                default_model,
+                num_ctx,
+            ));
+            debug!(provider = %id, "registered ollama-native");
+        }
     }
 }
 
@@ -250,6 +270,45 @@ pub fn known_provider_ids() -> Vec<String> {
 /// 调试用：打印 config 里的 provider 配置摘要。
 pub fn summarize(config: &ResolvedConfig) -> HashMap<String, bool> {
     config.providers.iter()
-        .map(|(id, e)| (id.clone(), e.api_key.as_deref().map(|k| !k.is_empty()).unwrap_or(false)))
+        .map(|(id, e)| (id.clone(), !e.api_key.is_empty()))
         .collect()
+}
+
+fn merge_config_providers(
+    cat: &mut HashMap<String, catalog::CatalogEntry>,
+    providers: &HashMap<String, ring_core::config::ProviderEntry>,
+) {
+    for (id, entry) in providers {
+        let kind = entry.provider_type.as_deref()
+            .and_then(|t| serde_json::from_str::<catalog::ProviderKind>(&format!("\"{t}\"")).ok());
+
+        if let Some(existing) = cat.get_mut(id) {
+            if !entry.api_key.is_empty() {
+                existing.api_key = entry.api_key.clone();
+            }
+            if let Some(url) = &entry.base_url {
+                existing.base_url = Some(url.clone());
+            }
+            if let Some(name) = &entry.name {
+                existing.name = name.clone();
+            }
+            if let Some(k) = kind {
+                existing.kind = k;
+            }
+        } else {
+            let Some(k) = kind else {
+                debug!(provider = %id, "config provider missing 'type', skipping");
+                continue;
+            };
+            cat.insert(id.clone(), catalog::CatalogEntry {
+                name: entry.name.clone().unwrap_or_else(|| id.clone()),
+                kind: k,
+                base_url: entry.base_url.clone(),
+                api_key: entry.api_key.clone(),
+                api_key_env: None,
+                default_model: None,
+                extra_body: None,
+            });
+        }
+    }
 }

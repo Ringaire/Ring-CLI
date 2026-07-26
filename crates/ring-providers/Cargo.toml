@@ -24,3 +24,4 @@ sha2         = { workspace = true }
 rand         = { workspace = true }
 url          = { workspace = true }
 chrono       = { workspace = true }
+os_info      = { workspace = true }

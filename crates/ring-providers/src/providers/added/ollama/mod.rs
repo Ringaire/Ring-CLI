@@ -9,10 +9,10 @@ use crate::catalog::{CatalogEntry, ProviderKind};
 /// 该 provider 的 catalog 条目（本地，无需 API key）。
 pub fn catalog_entry() -> CatalogEntry {
     CatalogEntry {
-        api_key: None,
+        api_key: Vec::new(),
         name: "Ollama".into(),
-        kind: ProviderKind::OpenAiCompatible,
-        base_url: Some("http://localhost:11434/v1".into()),
+        kind: ProviderKind::OllamaNative,
+        base_url: Some("http://localhost:11434".into()),
         api_key_env: None,
         default_model: Some("llama3.2".into()),
         extra_body: Some(serde_json::json!({"options": {"num_ctx": 32768}})),
